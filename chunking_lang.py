@@ -19,11 +19,11 @@ class AnsibleLogSplitter(RecursiveCharacterTextSplitter):
         # Define safe Ansible-specific separators without inline flags
         # (langchain wraps patterns in capturing groups, breaking inline flags)
         base_separators = [
+            # RECAP sections - highest priority, preserve as complete units
+            r"^PLAY RECAP \*+",
+            
             # Major boundaries - PLAY sections 
             r"^PLAY \[.*?\] \*+",
-            
-            # PLAY RECAP sections  
-            r"^PLAY RECAP \*+",
             
             # Task boundaries
             r"^TASK \[.*?\] \*+", 
@@ -49,8 +49,9 @@ class AnsibleLogSplitter(RecursiveCharacterTextSplitter):
         
         # Customize separators based on use case
         if splitter_type == "alert":
-            # For real-time alert processing
+            # For real-time alert processing - still prioritize RECAP
             separators = [
+                r"^PLAY RECAP \*+",
                 r"^fatal: \[.*?\]: FAILED!",
                 r"^UNREACHABLE!",  
                 r"^FAILED - RETRYING:",
@@ -59,8 +60,9 @@ class AnsibleLogSplitter(RecursiveCharacterTextSplitter):
             ]
             
         elif splitter_type == "error": 
-            # For error analysis
+            # For error analysis - RECAP contains error summaries
             separators = [
+                r"^PLAY RECAP \*+",
                 r"^fatal: \[.*?\]: FAILED!",
                 r"^UNREACHABLE!",
                 r"^FAILED - RETRYING:", 
@@ -105,26 +107,96 @@ def extract_ansible_metadata_from_chunks(chunks: List[str]) -> List[Dict[str, An
         metadata = {
             'chunk_index': i,
             'chunk_text': chunk,
+            'chunk_type': 'standard',  # Will be overridden for special types
             'playbook_name': None,
-            'task_name': None,
+            'task_names': [],  # Changed to list to capture all tasks
             'hosts': [],
-            'status': None,
-            'timestamp': None,
+            'statuses': [],  # Changed to list to capture all statuses
+            'timestamps': [],  # Changed to list to capture all timestamps
             'has_error': False,
-            'error_type': None,
-            'duration': None,
-            'retry_count': 0
+            'error_types': [],  # Changed to list to capture all error types
+            'durations': [],  # Changed to list to capture all durations
+            'retry_counts': [],  # Changed to list for multiple retry scenarios
+            'host_stats': {},  # For PLAY RECAP statistics
+            'task_timings': []  # For TASKS RECAP timings
         }
         
-        # Extract playbook/play name
-        playbook_match = re.search(r'PLAY \[(.*?)\]', chunk)
-        if playbook_match:
-            metadata['playbook_name'] = playbook_match.group(1)
+        # Check if this is a RECAP chunk (highest priority)
+        if re.search(r'^PLAY RECAP \*+', chunk, re.MULTILINE):
+            metadata['chunk_type'] = 'RECAP'
+            metadata['status'] = 'SUMMARY'
+            
+            # Extract host statistics from PLAY RECAP
+            host_stat_pattern = r'^([\w\.\-]+)\s*:\s*ok=(\d+)\s+changed=(\d+)\s+unreachable=(\d+)\s+failed=(\d+)\s+skipped=(\d+)\s+rescued=(\d+)\s+ignored=(\d+)'
+            host_stats = re.findall(host_stat_pattern, chunk, re.MULTILINE)
+            
+            for host_stat in host_stats:
+                hostname, ok, changed, unreachable, failed, skipped, rescued, ignored = host_stat
+                metadata['host_stats'][hostname] = {
+                    'ok': int(ok),
+                    'changed': int(changed), 
+                    'unreachable': int(unreachable),
+                    'failed': int(failed),
+                    'skipped': int(skipped),
+                    'rescued': int(rescued),
+                    'ignored': int(ignored)
+                }
+                
+                # Determine overall status from host stats
+                if int(failed) > 0 or int(unreachable) > 0:
+                    metadata['has_error'] = True
+                    if int(unreachable) > 0:
+                        metadata['error_types'].append('HOST_UNREACHABLE_SUMMARY')
+                    if int(failed) > 0:
+                        metadata['error_types'].append('TASK_FAILED_SUMMARY')
+            
+            # Extract all hosts mentioned in RECAP
+            metadata['hosts'] = list(metadata['host_stats'].keys())
         
-        # Extract task name  
-        task_match = re.search(r'TASK \[(.*?)\]', chunk)
-        if task_match:
-            metadata['task_name'] = task_match.group(1)
+        # Extract task timings from TASKS RECAP section (explicit or implicit) - independent of RECAP detection
+        has_task_timings = False
+        
+        # Check for explicit TASKS RECAP section
+        if 'TASKS RECAP' in chunk:
+            has_task_timings = True
+            timing_pattern = r'^([^-]+?)\s*-+\s*([\d\.]+)s'
+            task_timings = re.findall(timing_pattern, chunk, re.MULTILINE)
+        
+        # Check for implicit TASKS RECAP (after ===============================================================================)
+        elif '===============================================================================' in chunk:
+            has_task_timings = True
+            # Split the chunk by the equals line and process the part after it
+            parts = chunk.split('===============================================================================')
+            if len(parts) > 1:
+                tasks_section = parts[-1]  # Get the last part after the equals line
+                # Pattern for task lines: task_name followed by dashes and time
+                timing_pattern = r'^([^-]+?)\s*-+\s*([\d\.]+)s'
+                task_timings = re.findall(timing_pattern, tasks_section, re.MULTILINE)
+            else:
+                task_timings = []
+        
+        if has_task_timings:
+            for task_name, duration in task_timings:
+                metadata['task_timings'].append({
+                    'task': task_name.strip(),
+                    'duration_seconds': float(duration)
+                })
+                
+            # Sort by duration (longest first) for priority analysis
+            metadata['task_timings'].sort(key=lambda x: x['duration_seconds'], reverse=True)
+        
+        # Standard chunk processing (existing logic) - only if not a RECAP chunk
+        if metadata['chunk_type'] != 'RECAP':
+            
+            # Extract playbook/play name
+            playbook_match = re.search(r'PLAY \[(.*?)\]', chunk)
+            if playbook_match:
+                metadata['playbook_name'] = playbook_match.group(1)
+            
+            # Extract ALL task names (not just the first one)
+            task_matches = re.findall(r'TASK \[(.*?)\]', chunk)
+            if task_matches:
+                metadata['task_names'] = task_matches
         
         # Extract all host information (improved with case-insensitive patterns)
         host_patterns = [
@@ -141,31 +213,34 @@ def extract_ansible_metadata_from_chunks(chunks: List[str]) -> List[Dict[str, An
         if host_matches:
             metadata['hosts'] = list(set(host_matches))  # Remove duplicates
         
-        # Extract status and error information (case-insensitive, error priority)
-        if re.search(r'(?i)FAILED!', chunk):
-            metadata['status'] = 'FAILED'
-            metadata['has_error'] = True
-            metadata['error_type'] = 'TASK_FAILED'
-        elif re.search(r'(?i)UNREACHABLE!', chunk):
-            metadata['status'] = 'UNREACHABLE'
-            metadata['has_error'] = True
-            metadata['error_type'] = 'HOST_UNREACHABLE'
-        elif re.search(r'(?i)FAILED - RETRYING', chunk):
-            metadata['status'] = 'RETRYING'
-            metadata['has_error'] = True
-            metadata['error_type'] = 'RETRY_FAILURE'
-            # Extract retry count
-            retry_match = re.search(r'(?i)FAILED - RETRYING:.*\((\d+) retries left\)', chunk)
-            if retry_match:
-                metadata['retry_count'] = int(retry_match.group(1))
-        elif re.search(r'(?i)changed:', chunk):
-            metadata['status'] = 'CHANGED'
-        elif re.search(r'(?i)ok:', chunk):
-            metadata['status'] = 'OK'
-        elif re.search(r'(?i)skipping:', chunk):
-            metadata['status'] = 'SKIPPING'
+        # Extract ALL status and error information (comprehensive extraction)
+        status_patterns = [
+            (r'(?i)FAILED!', 'FAILED', 'TASK_FAILED'),
+            (r'(?i)UNREACHABLE!', 'UNREACHABLE', 'HOST_UNREACHABLE'),
+            (r'(?i)FAILED - RETRYING', 'RETRYING', 'RETRY_FAILURE'),
+            (r'(?i)changed:', 'CHANGED', None),
+            (r'(?i)ok:', 'OK', None),
+            (r'(?i)skipping:', 'SKIPPING', None),
+            (r'(?i)included:', 'INCLUDED', None)
+        ]
         
-        # Extract timestamp (multiple formats)
+        for pattern, status_name, error_type in status_patterns:
+            matches = re.findall(pattern, chunk)
+            if matches:
+                # Add status for each occurrence
+                metadata['statuses'].extend([status_name] * len(matches))
+                
+                # Track errors
+                if error_type:
+                    metadata['has_error'] = True
+                    metadata['error_types'].extend([error_type] * len(matches))
+        
+        # Extract ALL retry counts
+        retry_matches = re.findall(r'(?i)FAILED - RETRYING:.*\((\d+) retries left\)', chunk)
+        if retry_matches:
+            metadata['retry_counts'] = [int(count) for count in retry_matches]
+        
+        # Extract ALL timestamps (multiple formats)
         timestamp_patterns = [
             r'([A-Za-z]+ \d+ [A-Za-z]+ \d{4}\s+\d{2}:\d{2}:\d{2})',
             r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})',
@@ -173,15 +248,13 @@ def extract_ansible_metadata_from_chunks(chunks: List[str]) -> List[Dict[str, An
         ]
         
         for pattern in timestamp_patterns:
-            timestamp_match = re.search(pattern, chunk)
-            if timestamp_match:
-                metadata['timestamp'] = timestamp_match.group(1)
-                break
+            timestamps = re.findall(pattern, chunk)
+            metadata['timestamps'].extend(timestamps)
         
-        # Extract duration if available
-        duration_match = re.search(r'\((\d+:\d{2}:\d{2}\.\d+)\)', chunk)
-        if duration_match:
-            metadata['duration'] = duration_match.group(1)
+        # Extract ALL durations
+        duration_matches = re.findall(r'\((\d+:\d{2}:\d{2}\.\d+)\)', chunk)
+        if duration_matches:
+            metadata['durations'] = duration_matches
         
         metadata_chunks.append(metadata)
     
@@ -267,28 +340,64 @@ def create_alert_patterns_from_metadata(metadata_chunks: List[Dict[str, Any]]) -
         Dictionary of alert patterns for the monitoring system
     """
     alert_patterns = {
+        'playbook_completion_summary': {
+            'condition': lambda m: m.get('chunk_type') == 'RECAP',
+            'severity': 'info',
+            'description': 'Playbook execution completed with summary statistics',
+            'natural_language': 'Notify when playbook completes and provide summary statistics'
+        },
+        'recap_with_failures': {
+            'condition': lambda m: (m.get('chunk_type') == 'RECAP' and 
+                                  m.get('has_error') and 
+                                  any(error in m.get('error_types', []) for error in ['TASK_FAILED_SUMMARY', 'HOST_UNREACHABLE_SUMMARY'])),
+            'severity': 'critical',
+            'description': 'Playbook completed but has failed or unreachable hosts',
+            'natural_language': 'Critical alert when playbook summary shows failures or unreachable hosts'
+        },
+        'long_running_tasks': {
+            'condition': lambda m: (m.get('chunk_type') == 'RECAP' and 
+                                  m.get('task_timings') and
+                                  any(t['duration_seconds'] > 300 for t in m.get('task_timings', []))),
+            'severity': 'medium',
+            'description': 'Tasks took longer than 5 minutes to complete',
+            'natural_language': 'Alert when tasks exceed normal execution time baselines'
+        },
         'unreachable_hosts': {
-            'condition': lambda m: m.get('error_type') == 'HOST_UNREACHABLE',
+            'condition': lambda m: 'HOST_UNREACHABLE' in m.get('error_types', []),
             'severity': 'critical',
             'description': 'Host became unreachable during Ansible execution',
             'natural_language': 'Page me if any host shows UNREACHABLE status'
         },
         'failed_tasks': {
-            'condition': lambda m: m.get('error_type') == 'TASK_FAILED',
+            'condition': lambda m: 'TASK_FAILED' in m.get('error_types', []),
             'severity': 'high',
             'description': 'Ansible task execution failed',
             'natural_language': 'Alert when Ansible tasks fail'
         },
         'retry_failures': {
-            'condition': lambda m: m.get('error_type') == 'RETRY_FAILURE' and m.get('retry_count', 0) < 3,
+            'condition': lambda m: ('RETRY_FAILURE' in m.get('error_types', []) and 
+                                   any(count < 3 for count in m.get('retry_counts', []))),
             'severity': 'medium', 
             'description': 'Task is retrying with few attempts remaining',
             'natural_language': 'Notify if task retries are running low'
         },
+        'multiple_task_failures': {
+            'condition': lambda m: (len([s for s in m.get('statuses', []) if s in ['FAILED', 'UNREACHABLE']]) > 1),
+            'severity': 'critical',
+            'description': 'Multiple tasks failed in the same execution block',
+            'natural_language': 'Critical alert when multiple tasks fail in sequence'
+        },
+        'mixed_statuses': {
+            'condition': lambda m: (len(set(m.get('statuses', []))) > 2 and 'FAILED' in m.get('statuses', [])),
+            'severity': 'medium',
+            'description': 'Mixed success and failure statuses in task execution',
+            'natural_language': 'Alert when task block has mixed success/failure results'
+        },
         'playbook_duration_anomaly': {
-            'condition': lambda m: m.get('playbook_name') and m.get('duration'),
+            'condition': lambda m: (m.get('playbook_name') and 
+                                   len(m.get('durations', [])) > 0),
             'severity': 'low',
-            'description': 'Playbook execution time exceeds baseline',
+            'description': 'Playbook execution time may exceed baseline',
             'natural_language': 'Alert if playbook duration exceeds normal baseline'
         }
     }
@@ -324,7 +433,7 @@ if __name__ == "__main__":
     # Initialize the splitter
     splitter = AnsibleLogSplitter(splitter_type="context", chunk_size=800, chunk_overlap=100)
     
-    with open('log_files/job_1434559.txt', 'r') as file:
+    with open('log_files/job_1434764.txt', 'r') as file:
         text = file.read()
     
     print(f"Log file size: {len(text)} characters")
@@ -334,7 +443,29 @@ if __name__ == "__main__":
     print(f"Created {len(chunks)} chunks")
     
     # Display results
-    for i, chunk in enumerate(chunks[:5]):  # Show first 5 chunks
-        print(f"=== Chunk {i+1} ===")
-        print(chunk[:200] + "..." if len(chunk) > 200 else chunk)
-        print()
+    # for i, chunk in enumerate(chunks[:5]):  # Show first 5 chunks
+    #     print(f"=== Chunk {i+1} ===")
+    #     print(chunk)
+    #     metadata = extract_ansible_metadata_from_chunks([chunk])
+    #     print(metadata)
+        
+        
+    # # Extract metadata from each chunk type
+    # print(chunks[-25])
+    print("--------------------------------")       
+    print(chunks[10])
+    print("here is the metadata") 
+    print(extract_ansible_metadata_from_chunks([chunks[10]]))
+    print("--------------------------------")
+    # print(chunks[-4])
+    # print("here is the metadata") 
+    # print(extract_ansible_metadata_from_chunks([chunks[-8]])) 
+    # print("--------------------------------")
+
+
+    #Process logs for monitoring
+    monitoring_results = process_ansible_logs_for_monitoring(text)
+    print(monitoring_results)
+
+    # Create alert patterns from metadata
+    alert_patterns = create_alert_patterns_from_metadata(monitoring_results['context_analysis']['metadata'])
