@@ -425,7 +425,7 @@ def create_ansible_splitter_for_monitoring():
     Create a splitter optimized for the Ansible Log Monitoring System requirements.
     """
     return AnsibleLogSplitter(
-        chunk_size=3500,  # Larger chunks to preserve play context
+        chunk_size=3500,  
         chunk_overlap=300  # Good overlap to catch cross-boundary correlations
     )
 
@@ -442,12 +442,12 @@ if __name__ == "__main__":
     chunks = splitter.split_text(text)
     print(f"Created {len(chunks)} chunks")
     
-    # Display results
-    # for i, chunk in enumerate(chunks[:5]):  # Show first 5 chunks
-    #     print(f"=== Chunk {i+1} ===")
-    #     print(chunk)
-    #     metadata = extract_ansible_metadata_from_chunks([chunk])
-    #     print(metadata)
+    #Display results
+    for i, chunk in enumerate(chunks[:5]):  # Show first 5 chunks
+         print(f"=== Chunk {i+1} ===")
+         print(chunk)
+         metadata = extract_ansible_metadata_from_chunks([chunk])
+         print(metadata)
         
         
     # # Extract metadata from each chunk type
